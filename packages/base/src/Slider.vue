@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import InputNumber from './InputNumber.vue'
 
-type SliderValue = number | [number, number]
+type SliderValue = number | [number, number] | string
 type DragTarget = 'single' | 'start' | 'end' | 'track' | null
 
 const props = withDefaults(
