@@ -9,7 +9,7 @@ const Dialog = defineAsyncComponent(() => import('@typewords/base/Dialog'))
 
 let settingStore = useSettingStore()
 let show = $ref(false)
-let countDown = $ref(5)
+let countDown = $ref(3)
 
 watch(
   () => settingStore.load,

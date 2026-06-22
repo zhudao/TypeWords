@@ -7,8 +7,8 @@ import { useBaseStore } from '@typewords/core/stores/base.ts'
 import { useRuntimeStore } from '@typewords/core/stores/runtime.ts'
 import { DictType } from '@typewords/core/types/enum.ts'
 import { getDefaultArticle, getDefaultDict, getDefaultWord } from '@typewords/core/types/func.ts'
-import type { Article, Dict } from '@typewords/core/types/types.ts'
-import { cloneDeep, loadJsLib } from '@typewords/core/utils'
+import type { Article, Dict, Word } from '@typewords/core/types/types.ts'
+import { cloneDeep, convertToWord, loadJsLib } from '@typewords/core/utils'
 import saveAs from 'file-saver'
 import { nanoid } from 'nanoid'
 import { computed, onMounted, ref, watch } from 'vue'
@@ -23,8 +23,13 @@ import type { FailedWordRow } from '~/components/import/WordFailedTable.vue'
 type ImportStep = 1 | 2 | 3
 type ImportType = 'word' | 'article'
 
+type ImportMode = 'official' | 'custom'
+
 type ImportResultSummary = {
   successCount: number
+  officialCount?: number
+  customCount?: number
+  importMode?: ImportMode
   skippedCount: number
   failedItems: string[]
   pendingFailedWords?: FailedWordRow[]
@@ -33,6 +38,8 @@ type ImportResultSummary = {
 
 const IMPORT_RESULT_STORAGE_PREFIX = 'import-result-'
 const IMPORT_ARTICLES_COUNT_PREFIX = 'import-articles-count-'
+const CUSTOM_WORD_TEMPLATE_FILE = 'import-custom-word-template.xlsx'
+const CUSTOM_WORD_XLSX_COLUMNS = ['单词', '音标①', '音标②', '翻译', '例句', '短语', '近义词', '同根词', '词源'] as const
 
 const route = useRoute()
 const router = useRouter()
@@ -46,7 +53,11 @@ const showCreateForm = ref(false)
 const textInput = ref('')
 const selectedFile = ref<File | null>(null)
 const selectedFileName = ref('')
+const selectedCustomFile = ref<File | null>(null)
+const selectedCustomFileName = ref('')
 const uploading = ref(false)
+const importingCustom = ref(false)
+const downloadingFailed = ref(false)
 const importing = ref(false)
 const importSummary = ref<ImportResultSummary | null>(null)
 const { t } = useI18n()
@@ -60,6 +71,13 @@ const currentTarget = computed(() => selectedDict.value ?? pendingDict.value)
 const failedCount = computed(() => importSummary.value?.failedItems.length ?? 0)
 const pendingFailedCount = computed(() => importSummary.value?.pendingFailedWords?.length ?? 0)
 const hasPendingFailedWords = computed(() => isWord.value && pendingFailedCount.value > 0)
+const isCustomImportResult = computed(() => importSummary.value?.importMode === 'custom')
+const officialCount = computed(() => {
+  if (!importSummary.value || !isWord.value) return 0
+  if (importSummary.value.importMode === 'custom') return importSummary.value.officialCount ?? 0
+  return importSummary.value.officialCount ?? importSummary.value.successCount ?? 0
+})
+const customCount = computed(() => importSummary.value?.customCount ?? 0)
 const retryingFailed = ref(false)
 const importingBlank = ref(false)
 
@@ -81,19 +99,26 @@ function loadImportSummary(targetId: string): ImportResultSummary | null {
     if (!raw) return null
     const summary = JSON.parse(raw) as Partial<ImportResultSummary>
     const type = summary.type ?? importType.value
-    const pendingFailedWords = summary.pendingFailedWords?.map(row => ({
-      ...row,
-      editing: false,
-    })) ?? (type === 'word' && summary.failedItems?.length
-      ? summary.failedItems.map(word => ({
-          id: nanoid(6),
-          word,
-          checked: true,
-          editing: false,
-        }))
-      : undefined)
+    const pendingFailedWords =
+      summary.pendingFailedWords?.map(row => ({
+        ...row,
+        editing: false,
+      })) ??
+      (type === 'word' && summary.failedItems?.length
+        ? summary.failedItems.map(word => ({
+            id: nanoid(6),
+            word,
+            checked: true,
+            editing: false,
+          }))
+        : undefined)
+    const successCount = summary.successCount ?? 0
+    const importMode = summary.importMode ?? (type === 'word' ? 'official' : undefined)
     return {
-      successCount: summary.successCount ?? 0,
+      successCount,
+      officialCount: summary.officialCount ?? (importMode === 'custom' ? 0 : successCount),
+      customCount: summary.customCount ?? 0,
+      importMode,
       skippedCount: summary.skippedCount ?? 0,
       failedItems: pendingFailedWords?.map(row => row.word) ?? summary.failedItems ?? [],
       pendingFailedWords,
@@ -115,6 +140,13 @@ const manualWords = computed(() =>
     .filter(Boolean)
 )
 
+const hasManualInput = computed(() => manualWords.value.length > 0)
+const hasOfficialFile = computed(() => !!selectedFile.value)
+const hasCustomFile = computed(() => !!selectedCustomFile.value)
+const officialUploadDisabled = computed(() => hasManualInput.value || hasCustomFile.value)
+const customUploadDisabled = computed(() => hasManualInput.value || hasOfficialFile.value)
+const manualInputDisabled = computed(() => hasOfficialFile.value || hasCustomFile.value)
+
 function findTargetById(id?: string) {
   if (!id) return null
   return source.value.bookList.find(item => String(item.id) === id || String(item.userDictId ?? '') === id) ?? null
@@ -125,7 +157,6 @@ function normalizeStep(value: unknown): ImportStep {
   if (value === '2' || value === 2) return 2
   return 1
 }
-
 
 function restoreFromRoute() {
   step.value = normalizeStep(route.query.step)
@@ -177,6 +208,8 @@ watch(importType, () => {
   textInput.value = ''
   selectedFile.value = null
   selectedFileName.value = ''
+  selectedCustomFile.value = null
+  selectedCustomFileName.value = ''
   importSummary.value = null
   if (!route.query.step) step.value = 1
 })
@@ -295,14 +328,42 @@ function getCheckedFailedRows(): FailedWordRow[] {
 }
 
 function downloadFailedTxt() {
-  const items = hasPendingFailedWords.value
-    ? (importSummary.value?.pendingFailedWords ?? []).map(row => row.word)
-    : (importSummary.value?.failedItems ?? [])
+  const items = importSummary.value?.failedItems ?? []
   if (!items.length) return
   const content = items.join('\n')
   const blob = new Blob([content], { type: 'text/plain;charset=utf-8' })
   const name = runtimeStore.editDict.name || currentTarget.value?.name || '导入'
   saveAs(blob, `导入失败-${name}.txt`)
+}
+
+function createEmptyCustomWordRow(word: string) {
+  return CUSTOM_WORD_XLSX_COLUMNS.reduce(
+    (row, column) => {
+      row[column] = column === '单词' ? word : ''
+      return row
+    },
+    {} as Record<(typeof CUSTOM_WORD_XLSX_COLUMNS)[number], string>
+  )
+}
+
+async function downloadFailedXlsx() {
+  const words = importSummary.value?.pendingFailedWords?.map(row => row.word) ?? []
+  if (!words.length) return
+
+  downloadingFailed.value = true
+  try {
+    const XLSX = await loadJsLib('XLSX', LIB_JS_URL.XLSX)
+    const sheetData = words.map(word => createEmptyCustomWordRow(word))
+    const wb = XLSX.utils.book_new()
+    wb.Sheets.Sheet1 = XLSX.utils.json_to_sheet(sheetData)
+    wb.SheetNames = ['Sheet1']
+    const name = runtimeStore.editDict.name || currentTarget.value?.name || '导入'
+    XLSX.writeFile(wb, `未收录单词-${name}.xlsx`)
+  } catch {
+    Toast.error('下载失败，请稍后重试')
+  } finally {
+    downloadingFailed.value = false
+  }
 }
 
 function goBackToStep2() {
@@ -421,6 +482,105 @@ async function parseWordFile(file: File): Promise<string[]> {
   throw new Error(`不支持的文件格式「${ext}」，请使用 .txt / .json / .xlsx`)
 }
 
+function getWordRowField(row: Record<string, unknown>, ...keys: string[]) {
+  for (const key of keys) {
+    const val = row[key]
+    if (val !== undefined && val !== null && String(val).trim()) {
+      return String(val).trim()
+    }
+  }
+  return ''
+}
+
+function parseCustomWordRow(row: Record<string, unknown>): Word | null {
+  const word = getWordRowField(row, '单词', 'word')
+  if (!word) return null
+
+  try {
+    const parsed = convertToWord({
+      id: nanoid(6),
+      word,
+      phonetic0: row['音标①'] ?? row.phonetic0 ?? '',
+      phonetic1: row['音标②'] ?? row.phonetic1 ?? '',
+      trans: row['翻译'] ?? row.trans ?? '',
+      sentences: row['例句'] ?? row.sentences ?? '',
+      phrases: row['短语'] ?? row.phrases ?? '',
+      synos: row['近义词'] ?? row.synos ?? '',
+      relWords: row['同根词'] ?? row.relWords ?? '',
+      etymology: row['词源'] ?? row.etymology ?? '',
+    })
+    const noteVal = getWordRowField(row, '笔记', 'note')
+    if (noteVal) {
+      base.noteData[word] = noteVal
+    }
+    return parsed
+  } catch (error: any) {
+    console.error('导入单词报错' + word, error?.message)
+    return null
+  }
+}
+
+async function parseCustomXlsxWordFile(file: File): Promise<Word[]> {
+  const ext = getFileExt(file)
+  if (ext !== 'xlsx' && ext !== 'xls') {
+    throw new Error(`不支持的文件格式「${ext}」，请使用 .xlsx`)
+  }
+
+  const XLSX = await loadJsLib('XLSX', LIB_JS_URL.XLSX)
+  const data = await readFileAsBinary(file)
+  const workbook = XLSX.read(data, { type: 'binary' })
+  const sheetName = workbook.SheetNames[0]
+  const rows: Record<string, unknown>[] = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName])
+
+  const words: Word[] = []
+  const seen = new Set<string>()
+  rows.forEach(row => {
+    const parsed = parseCustomWordRow(row)
+    if (!parsed?.word) return
+    const key = parsed.word.toLowerCase()
+    if (seen.has(key)) return
+    seen.add(key)
+    words.push(parsed)
+  })
+  return words
+}
+
+function mergeCustomWords(target: Dict, customWords: Word[]): { next: Dict; summary: ImportResultSummary } | null {
+  const next = cloneDeep(target)
+  const existsSet = new Set(next.words.map(w => w.word))
+  let customCountAdded = 0
+  let skippedCount = 0
+
+  customWords.forEach(word => {
+    if (existsSet.has(word.word)) {
+      skippedCount++
+      return
+    }
+    next.words.push(word)
+    existsSet.add(word.word)
+    customCountAdded++
+  })
+
+  if (!customCountAdded) {
+    Toast.warning('所有单词已存在于词典中，无需重复导入')
+    return null
+  }
+
+  next.length = next.words.length
+  return {
+    next,
+    summary: {
+      successCount: customCountAdded,
+      officialCount: 0,
+      customCount: customCountAdded,
+      importMode: 'custom',
+      skippedCount,
+      failedItems: [],
+      type: 'word',
+    },
+  }
+}
+
 type ArticleParseResult = {
   articles: Article[]
   failedItems: string[]
@@ -530,12 +690,7 @@ function splitArticlesByDuplicate(target: Dict, articles: Article[]) {
   return { repeat, noRepeat }
 }
 
-function applyArticleMerge(
-  target: Dict,
-  noRepeat: Article[],
-  repeat: ArticleWithIndex[],
-  overwriteRepeat: boolean
-) {
+function applyArticleMerge(target: Dict, noRepeat: Article[], repeat: ArticleWithIndex[], overwriteRepeat: boolean) {
   const next = cloneDeep(target)
   noRepeat.forEach(article => next.articles.push(article))
   let successCount = noRepeat.length
@@ -629,6 +784,9 @@ async function mergeWordsFromList(
 
   const summary: ImportResultSummary = {
     successCount: foundItems.length,
+    officialCount: foundItems.length,
+    customCount: 0,
+    importMode: 'official',
     skippedCount,
     failedItems: missing,
     pendingFailedWords,
@@ -689,6 +847,7 @@ async function retryFailedImport() {
 
     updateImportSummary({
       successCount: (importSummary.value?.successCount ?? 0) + added,
+      officialCount: (importSummary.value?.officialCount ?? officialCount.value) + added,
       pendingFailedWords: pending,
     })
 
@@ -761,6 +920,7 @@ async function importBlankFailedWords() {
 
     updateImportSummary({
       successCount: (importSummary.value?.successCount ?? 0) + added,
+      customCount: (importSummary.value?.customCount ?? 0) + added,
       pendingFailedWords: pending,
     })
 
@@ -793,6 +953,30 @@ function selectFile(e: any) {
   if (!file) return
   selectedFile.value = file
   selectedFileName.value = file.name
+}
+
+function selectCustomFile(e: any) {
+  const file = (e.target as HTMLInputElement).files?.[0]
+  if (!file) return
+  selectedCustomFile.value = file
+  selectedCustomFileName.value = file.name
+}
+
+async function importCustomWordFile() {
+  if (!selectedCustomFile.value) return Toast.warning('请先选择自定义单词文件')
+
+  importingCustom.value = true
+  try {
+    const customWords = await parseCustomXlsxWordFile(selectedCustomFile.value)
+    if (!customWords.length) return Toast.warning('文件中没有可导入的单词')
+    const target = await persistTarget()
+    const result = mergeCustomWords(target, customWords)
+    if (result) completeImport(result.next, result.summary)
+  } catch (error: any) {
+    Toast.error(error?.message || '导入失败')
+  } finally {
+    importingCustom.value = false
+  }
 }
 
 async function importSelectedFile() {
@@ -840,32 +1024,14 @@ async function importSelectedFile() {
 }
 
 function submitWordImport() {
-  const hasManual = manualWords.value.length > 0
-  if (hasManual) {
-    if (manualWords.value.length > 5000) {
-      return Toast.warning('单词数量超过5000')
-    }
+  if (manualWords.value.length > 5000) {
+    return Toast.warning('单词数量超过5000')
   }
-  const hasFile = !!selectedFile.value
-  if (!hasManual && !hasFile) return Toast.warning('请输入单词或选择文件')
-  if (hasManual && hasFile) {
-    MessageBox.confirm(
-      '检测到你同时填写了单词列表并选择了文件，请选择本次要导入的来源。',
-      '选择导入来源',
-      () => void 0,
-      () => importSelectedFile(),
-      null,
-      {
-        t,
-        confirmButtonText: '使用手动输入',
-        cancelButtonText: '使用上传文件',
-        onConfirm: () => importManualWords(),
-      }
-    )
-    return
-  }
-  if (hasManual) return importManualWords()
-  return importSelectedFile()
+
+  if (hasManualInput.value) return importManualWords()
+  if (hasOfficialFile.value) return importSelectedFile()
+  if (hasCustomFile.value) return importCustomWordFile()
+  return Toast.warning('请输入单词或选择文件')
 }
 
 async function goManualArticleEdit() {
@@ -951,17 +1117,32 @@ async function goManualArticleEditWithoutConfirm() {
             </li>
           </ul>
 
-          <div v-if="showCreateForm"
-            class="border border-[var(--color-input-border)] rounded-md p-4 bg-[var(--color-card-bg)]">
-            <EditBook :is-add="true" :is-book="!isWord" submit-mode="draft" fluid @submit="handleDraftSubmit"
-              @close="showCreateForm = false" />
+          <div
+            v-if="showCreateForm"
+            class="border border-[var(--color-input-border)] rounded-md p-4 bg-[var(--color-card-bg)]"
+          >
+            <EditBook
+              :is-add="true"
+              :is-book="!isWord"
+              submit-mode="draft"
+              fluid
+              @submit="handleDraftSubmit"
+              @close="showCreateForm = false"
+            />
           </div>
 
           <div class="section-title">{{ targetLabel }}列表</div>
           <div v-if="availableDicts.length" class="flex gap-4 flex-wrap">
-            <Book v-for="dict in availableDicts" :key="dict.id" :is-add="false" :item="dict"
-              :quantifier="isWord ? '词' : '篇'" :show-progress="false" :selected="currentTarget?.id === dict.id"
-              @click="selectTarget(dict)" />
+            <Book
+              v-for="dict in availableDicts"
+              :key="dict.id"
+              :is-add="false"
+              :item="dict"
+              :quantifier="isWord ? '词' : '篇'"
+              :show-progress="false"
+              :selected="currentTarget?.id === dict.id"
+              @click="selectTarget(dict)"
+            />
           </div>
           <div v-else class="empty-state">
             <IconFluentBook20Regular />
@@ -972,8 +1153,13 @@ async function goManualArticleEditWithoutConfirm() {
           <template v-if="pendingDict">
             <div class="section-title">新建待导入{{ targetLabel }}</div>
             <div class="flex gap-4 flex-wrap">
-              <Book :is-add="false" :item="pendingDict" :quantifier="isWord ? '词' : '篇'" :show-progress="false"
-                :selected="true" />
+              <Book
+                :is-add="false"
+                :item="pendingDict"
+                :quantifier="isWord ? '词' : '篇'"
+                :show-progress="false"
+                :selected="true"
+              />
             </div>
           </template>
 
@@ -996,39 +1182,83 @@ async function goManualArticleEditWithoutConfirm() {
                 <IconFluentArrowUpload20Regular />
                 <span>上传文件</span>
               </div>
-              <div class="my-2">支持导入 {{ isWord ? '.txt / .json / .xlsx' : '.json / .xlsx' }} 格式文件</div>
-              <div class="my-2 font-bold text-red">下载模板文件，按照固定格式填写后上传</div>
-              <div class="my-2 font-bold text-red">暂不支持导入 PDF 文件，您可让 AI 帮您制作导入所需格式的文件</div>
-              <div class="flex gap-3 flex-col mb-4">
-                <div v-if="isWord">
-                  <a href="#" @click.prevent="downloadWordTemplate(`import-${importType}-template.txt`)">下载 txt 模板</a>
+              <div
+                class="official-upload-block"
+                :class="{ 'import-block--disabled': isWord && officialUploadDisabled }"
+              >
+                <div class="my-2">支持导入 {{ isWord ? '.txt / .json / .xlsx' : '.json / .xlsx' }} 格式文件</div>
+                <div class="my-2 font-bold text-red">下载模板文件，按照固定格式填写后上传</div>
+                <div class="my-2 font-bold text-red">暂不支持导入 PDF 文件，您可让 AI 帮您制作导入所需格式的文件</div>
+                <div class="flex gap-3 flex-col mb-4">
+                  <div v-if="isWord">
+                    <a href="#" @click.prevent="downloadWordTemplate(`import-${importType}-template.txt`)"
+                      >下载 txt 模板</a
+                    >
+                  </div>
+                  <div>
+                    <a href="#" @click.prevent="downloadWordTemplate(`import-${importType}-template.json`)"
+                      >下载 json 模板</a
+                    >
+                  </div>
+                  <div>
+                    <a href="#" @click.prevent="downloadWordTemplate(`import-${importType}-template.xlsx`)"
+                      >下载 xlsx 模板</a
+                    >
+                  </div>
                 </div>
-                <div>
-                  <a href="#" @click.prevent="downloadWordTemplate(`import-${importType}-template.json`)">下载 json 模板</a>
-                </div>
-                <div>
-                  <a href="#" @click.prevent="downloadWordTemplate(`import-${importType}-template.xlsx`)">下载 xlsx 模板</a>
+                <div class="flex items-center gap-3 flex-wrap">
+                  <UploadButton
+                    :accept="isWord ? '.txt,.json,.xlsx,.xls' : '.json,.xlsx,.xls'"
+                    :loading="uploading"
+                    :disabled="isWord && officialUploadDisabled"
+                    @change="selectFile"
+                  >
+                    选择文件
+                  </UploadButton>
+                  <span class="color-gray text-sm" v-if="selectedFileName">{{ selectedFileName }}</span>
                 </div>
               </div>
-              <div class="flex items-center gap-3 flex-wrap">
-                <UploadButton :accept="isWord ? '.txt,.json,.xlsx,.xls' : '.json,.xlsx,.xls'" :loading="uploading"
-                  @change="selectFile">
-                  选择文件
-                </UploadButton>
-                <span class="color-gray text-sm" v-if="selectedFileName">{{ selectedFileName }}</span>
-              </div>
+
+              <template v-if="isWord">
+                <div class="custom-import-panel" :class="{ 'import-block--disabled': customUploadDisabled }">
+                  <div class="text-lg mt-2">导入自定义单词</div>
+                  <div class="my-2 color-gray text-sm">
+                    下载模板，填写翻译、音标、例句等字段后上传
+                  </div>
+                  <div class="flex gap-3 flex-col mb-4">
+                    <div>
+                      <a href="#" @click.prevent="downloadWordTemplate(CUSTOM_WORD_TEMPLATE_FILE)">下载 xlsx 模板</a>
+                    </div>
+                  </div>
+                  <div class="flex items-center gap-3 flex-wrap">
+                    <UploadButton
+                      accept=".xlsx,.xls"
+                      :loading="importingCustom"
+                      :disabled="customUploadDisabled"
+                      @change="selectCustomFile"
+                    >
+                      选择文件
+                    </UploadButton>
+                    <span class="color-gray text-sm" v-if="selectedCustomFileName">{{ selectedCustomFileName }}</span>
+                  </div>
+                </div>
+              </template>
             </div>
 
             <span>或</span>
             <!-- 右列：词典=手动输入，书籍=文章编辑 -->
-            <div class="method-panel" v-if="isWord">
+            <div class="method-panel" v-if="isWord" :class="{ 'method-panel--disabled': manualInputDisabled }">
               <div class="method-title">
                 <IconFluentTextAlignLeft16Regular />
                 <span>手动输入</span>
               </div>
-              <Textarea class="my-2" v-model="textInput"
+              <Textarea
+                class="my-2"
+                v-model="textInput"
+                :disabled="manualInputDisabled"
                 placeholder="一行一个单词，例如：&#10;apple,&#10;banana&#10;cherry&#10;行尾带不带逗号都可以"
-                :autosize="{ minRows: 20, maxRows: 20 }" />
+                :autosize="{ minRows: 20, maxRows: 20 }"
+              />
               <div class="method-footer">
                 <span>已输入 {{ manualWords.length }} / 5000 个单词</span>
               </div>
@@ -1040,7 +1270,8 @@ async function goManualArticleEditWithoutConfirm() {
               </div>
               <p>进入文章编辑页面，可以连续新增多篇文章。</p>
               <div class="text-right">
-                <BaseButton type="primary" size="large" :loading="importing" @click="goManualArticleEdit"> 进入文章编辑
+                <BaseButton type="primary" size="large" :loading="importing" @click="goManualArticleEdit">
+                  进入文章编辑
                 </BaseButton>
               </div>
             </div>
@@ -1048,12 +1279,24 @@ async function goManualArticleEditWithoutConfirm() {
 
           <div class="actions-row step2-actions">
             <BaseButton type="info" size="large" @click="step = 1">返回上一步</BaseButton>
-            <BaseButton v-if="isWord" type="primary" size="large" :loading="importing || uploading"
-              :disabled="!manualWords.length && !selectedFile" @click="submitWordImport">
+            <BaseButton
+              v-if="isWord"
+              type="primary"
+              size="large"
+              :loading="importing || uploading || importingCustom"
+              :disabled="!hasManualInput && !hasOfficialFile && !hasCustomFile"
+              @click="submitWordImport"
+            >
               提交
             </BaseButton>
-            <BaseButton v-else type="primary" size="large" :loading="uploading" :disabled="!selectedFile"
-              @click="importSelectedFile">
+            <BaseButton
+              v-else
+              type="primary"
+              size="large"
+              :loading="uploading"
+              :disabled="!selectedFile"
+              @click="importSelectedFile"
+            >
               提交
             </BaseButton>
           </div>
@@ -1070,24 +1313,33 @@ async function goManualArticleEditWithoutConfirm() {
               <span>导入完成</span>
             </div>
             <div class="ml-10">
-              <li>成功 {{ importSummary.successCount }} {{ isWord ? '个' : '篇' }}（已导入到{{ targetLabel }}中）</li>
-              <li v-if="importSummary.skippedCount">跳过 {{ importSummary.skippedCount }} {{ isWord ? '个' : '篇' }}（{{
-                targetLabel
-              }}中已存在）</li>
+              <template v-if="isWord && isCustomImportResult">
+                <li>自定义单词 {{ customCount }} 个（已导入到{{ targetLabel }}中）</li>
+              </template>
+              <template v-else-if="isWord">
+                <li>官方单词 {{ officialCount }} 个（已导入到{{ targetLabel }}中）</li>
+              </template>
+              <li v-else>成功 {{ importSummary.successCount }} 篇（已导入到{{ targetLabel }}中）</li>
+              <li v-if="importSummary.skippedCount">
+                跳过 {{ importSummary.skippedCount }} {{ isWord ? '个' : '篇' }}（{{ targetLabel }}中已存在）
+              </li>
               <li v-if="hasPendingFailedWords">
-                {{ pendingFailedCount }} 个未收录（尚未导入，可在下方表格处理）
+                <div>{{ pendingFailedCount }} 个未收录（尚未导入）</div>
+                <ul class="mt-1 pl-4">
+                  <li>
+                    可在下方表格修改后再次导入
+                  </li>
+                  <li>
+                    可点击“下载失败列表”按钮 ，填写翻译后，返回上一步通过「导入自定义单词」上传
+                  </li>
+                </ul>
               </li>
-              <li v-else-if="failedCount && !isWord">
-                {{ failedCount }} 个失败（原因：缺少 title 或 text 必填字段）
-              </li>
+              <li v-else-if="failedCount && !isWord">{{ failedCount }} 个失败（原因：缺少 title 或 text 必填字段）</li>
             </div>
           </div>
 
           <div v-if="hasPendingFailedWords" class="result-panel">
-            <WordFailedTable
-              :rows="importSummary.pendingFailedWords!"
-              @update:rows="onPendingFailedWordsUpdate"
-            />
+            <WordFailedTable :rows="importSummary.pendingFailedWords!" @update:rows="onPendingFailedWordsUpdate" />
           </div>
 
           <div v-else-if="failedCount && !isWord" class="result-panel">
@@ -1103,7 +1355,9 @@ async function goManualArticleEditWithoutConfirm() {
             <BaseButton type="info" size="large" @click="goBackToStep2">返回上一步</BaseButton>
             <div class="flex flex-wrap justify-end">
               <template v-if="hasPendingFailedWords">
-                <BaseButton type="info" size="large" @click="downloadFailedTxt">下载失败列表</BaseButton>
+                <BaseButton type="info" size="large" :loading="downloadingFailed" @click="downloadFailedXlsx">
+                  下载失败列表
+                </BaseButton>
                 <BaseButton type="info" size="large" :loading="retryingFailed" @click="retryFailedImport">
                   再次导入
                 </BaseButton>
@@ -1113,12 +1367,7 @@ async function goManualArticleEditWithoutConfirm() {
                 </BaseButton>
               </template>
               <template v-else>
-                <BaseButton
-                  v-if="!isWord && failedCount"
-                  type="info"
-                  size="large"
-                  @click="downloadFailedTxt"
-                >
+                <BaseButton v-if="!isWord && failedCount" type="info" size="large" @click="downloadFailedTxt">
                   下载失败列表
                 </BaseButton>
                 <BaseButton type="primary" size="large" @click="goToDetail">查看详情</BaseButton>
@@ -1297,6 +1546,19 @@ async function goManualArticleEditWithoutConfirm() {
   border-radius: 0.65rem;
 }
 
+.custom-import-panel {
+  border-top: 1px solid var(--color-input-border);
+  margin-top: 1rem;
+  padding-top: 1rem;
+}
+
+.method-panel--disabled,
+.import-block--disabled {
+  opacity: 0.55;
+  pointer-events: none;
+  user-select: none;
+}
+
 .create-panel {
   background: var(--color-input-bg);
   display: flex;
@@ -1388,7 +1650,7 @@ async function goManualArticleEditWithoutConfirm() {
     white-space: nowrap;
   }
 
-  >span:last-of-type {
+  > span:last-of-type {
     color: var(--color-font-3);
     font-size: 0.85rem;
     margin-top: 0.35rem;
@@ -1521,7 +1783,6 @@ async function goManualArticleEditWithoutConfirm() {
   }
 }
 
-
 @media (max-width: 1180px) {
   .import-header {
     align-items: flex-start;
@@ -1530,7 +1791,6 @@ async function goManualArticleEditWithoutConfirm() {
 }
 
 @media (max-width: 900px) {
-
   .import-layout,
   .input-split {
     grid-template-columns: 1fr;
@@ -1542,7 +1802,6 @@ async function goManualArticleEditWithoutConfirm() {
 }
 
 @media (max-width: 640px) {
-
   .import-header,
   .main-panel,
   .context-panel {

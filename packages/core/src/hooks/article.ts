@@ -368,7 +368,7 @@ export function usePlaySentenceAudio() {
         )
       }
     } else {
-      playWordAudio(sentence.text)
+      playWordAudio(sentence.text, false)
     }
   }
 

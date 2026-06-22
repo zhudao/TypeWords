@@ -113,44 +113,6 @@ async function init() {
   }
 }
 
-watch(
-  () => store?.sbook?.id,
-  n => {
-    if (!n && import.meta.client) {
-      _nextTick(async () => {
-        const Shepherd = await loadJsLib('Shepherd', LIB_JS_URL.SHEPHERD)
-        const tour = new Shepherd.Tour(TourConfig)
-        tour.on('cancel', () => {
-          localStorage.setItem('tour-guide', '1')
-        })
-        tour.addStep({
-          id: 'step7',
-          text: '点击这里选择一本书籍开始学习，步骤前面选词典相同，让我们跳过中间步骤，直接开始练习吧',
-          attachTo: {
-            element: '#no-book',
-            on: 'bottom',
-          },
-          buttons: [
-            {
-              text: `下一步（7/${TourConfig.total}）`,
-              action() {
-                tour.next()
-                nav('/practice-articles/article_nce2', { guide: 1 })
-              },
-            },
-          ],
-        })
-
-        const r = localStorage.getItem('tour-guide')
-        if (settingStore.first && !r && !isMobile()) {
-          tour.start()
-        }
-      }, 500)
-    }
-  },
-  { immediate: true }
-)
-
 function startStudy() {
   // console.log(store.sbook.articles[1])
   // genArticleSectionData(cloneDeep(store.sbook.articles[1]))

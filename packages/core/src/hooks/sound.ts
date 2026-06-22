@@ -129,6 +129,13 @@ export function usePlayCorrect() {
   return playAudio
 }
 
+const activeWordPlayCountMap = new Map<string, number>()
+
+export function resetActiveWordPlayCount(word: string) {
+  if (!word) return
+  activeWordPlayCountMap.delete(word.trim().toLowerCase())
+}
+
 export function usePlayWordAudio() {
   const settingStore = useSettingStore()
   let audio = ref<HTMLAudioElement>(null)
@@ -137,19 +144,30 @@ export function usePlayWordAudio() {
     audio.value = new Audio()
   })
 
-  function playAudio(word: string) {
+  function playAudio(word: string, handle: boolean = true) {
     if (!word) return
+    let playbackRate = settingStore.wordSoundSpeed
+    if (handle) {
+      const key = word.trim().toLowerCase()
+      const count = activeWordPlayCountMap.get(key) ?? 0
+      if (count % 3 !== 0) {
+        playbackRate = playbackRate * 0.75
+      }
+      activeWordPlayCountMap.set(key, count + 1)
+    }
+    // console.log('playAudio-handle', handle, playbackRate)
+
     let url = `${PronunciationApi}${word}&type=2`
     if (settingStore.soundType === 'uk') {
       url = `${PronunciationApi}${word}&type=1`
     }
     audio.value.src = url
     audio.value.volume = settingStore.wordSoundVolume / 100
-    audio.value.playbackRate = settingStore.wordSoundSpeed
+    audio.value.playbackRate = playbackRate
     audio.value.play()
-    audio.value.onerror = e => {
+    audio.value.onerror = () => {
       const ttsPlay = useTTsPlayAudio()
-      ttsPlay(word)
+      ttsPlay(word, { rate: playbackRate })
     }
   }
 

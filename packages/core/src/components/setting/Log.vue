@@ -1,6 +1,10 @@
 <script setup lang="ts">
 let logList = [
   {
+    date: '2026/06/22',
+    content: '重复播放单词，降低语速',
+  },
+  {
     date: '2026/06/18',
     content: '新增点击查词功能',
   },

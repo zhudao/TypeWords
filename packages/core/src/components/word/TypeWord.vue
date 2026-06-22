@@ -4,6 +4,7 @@ import { getDefaultWord, IdentifyMethod, ShortcutKey, WordPracticeType } from '.
 import { useBaseStore, useSettingStore } from '../../stores'
 import {
   getBrowserKey,
+  resetActiveWordPlayCount,
   usePlayBeep,
   usePlayCorrect,
   usePlayKeyboardAudio,
@@ -149,9 +150,10 @@ function reset() {
   currentPracticeSentenceIndex = -1
   wordCompletedTime = 0 // 重置时间戳
   wrongTimes.value = 0
+  resetActiveWordPlayCount(props.word.word)
   if (settingStore.wordSound) {
     if (settingStore.wordPracticeType !== WordPracticeType.Dictation) {
-      volumeIconRef?.play(400, true)
+      volumeIconRef?.play(false, true)
     }
   }
   // 更新当前单词信息
@@ -606,14 +608,18 @@ function typo() {
   wrongTimes.value++
 }
 
-function play() {
+function checkIsWrong() {
   if (settingStore.wordPracticeType === WordPracticeType.Dictation || settingStore.dictation) {
     if (!showWordResult.value && !right) {
       //输入完成，或者已显示的情况下，不记入错误
       typo()
     }
   }
-  volumeIconRef?.play()
+}
+
+function play() {
+  checkIsWrong()
+  volumeIconRef?.play(true)
 }
 
 defineExpose({ del, showWord, hideWord, play, showWordResult, wrongTimes })
@@ -725,7 +731,7 @@ const isCollect = $computed(() => isWordCollect(props.word))
           "
           v-if="settingStore.soundType === 'uk' && word.phonetic0"
         >
-          [{{ word.phonetic0 }}]
+          / {{ word.phonetic0 }} /
         </div>
         <div
           class="phonetic"
@@ -740,13 +746,14 @@ const isCollect = $computed(() => isWordCollect(props.word))
           "
           v-if="settingStore.soundType === 'us' && word.phonetic1"
         >
-          [{{ word.phonetic1 }}]
+          / {{ word.phonetic1 }} /
         </div>
         <VolumeIcon
           :title="`发音(${settingStore.shortcutKeyMap[ShortcutKey.PlayWordPronunciation]})`"
           ref="volumeIconRef"
           :simple="true"
-          :cb="() => playWordAudio(word.word)"
+          @click="checkIsWrong"
+          :cb="active => playWordAudio(word.word, active)"
         />
       </div>
 
@@ -1140,7 +1147,7 @@ const isCollect = $computed(() => isWordCollect(props.word))
     @apply text-lg;
   }
 
-  .pos{
+  .pos {
     @apply min-w-10;
   }
 }
