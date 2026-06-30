@@ -97,7 +97,7 @@ export function useWordPracticeAudio({ word, volumeIconRef, canSeeSentences }: W
     trigger: WordPlayTrigger,
     options?: { resetIcon?: boolean; volumeRef?: { animateOnly?: (reset?: boolean) => void } }
   ) {
-    if (!settingStore.wordSound) return
+    // if (!settingStore.wordSound) return
 
     const handle =
       trigger === WordPlayTrigger.RepeatWord ||
