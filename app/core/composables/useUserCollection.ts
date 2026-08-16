@@ -3,7 +3,7 @@ import { APP_VERSION } from '../config/env'
 import { useExport } from '../hooks/export'
 import { useBaseStore } from '../stores'
 import { getPracticeWordCacheLocal } from '../utils/cache'
-import { userCollectionPreflight, userCollectionUpload } from '@typewords/core/apis'
+import { userCollectionPreflight, userCollectionUpload } from '@/core/apis'
 
 const CLIENT_ID_KEY = 'typewords-user-collection-client-id'
 const THREE_HOURS_MS = 3 * 60 * 60 * 1000
@@ -71,7 +71,6 @@ async function hasReachedCollectionThreshold(): Promise<boolean> {
 export async function checkAndUploadUserCollection(): Promise<void> {
   if (!import.meta.client || checkedThisSession) return
   checkedThisSession = true
-  debugger
 
   try {
     if (!(await hasReachedCollectionThreshold())) return
